@@ -1,0 +1,17 @@
+run: python run.py
+seed: python seed.py
+test: python -m unittest discover -s tests -v
+base_url: http://localhost:5000
+endpoints:
+  - method: POST
+    path: /generate
+    description: records one usage event for a tenant, checks quota, returns cost
+  - method: GET
+    path: /usage
+    description: returns a rollup of usage, plan limits and cost for a tenant
+  - method: POST
+    path: /checkout
+    description: creates a Stripe test mode checkout session for the Pro plan
+  - method: POST
+    path: /webhooks/stripe
+    description: receives and verifies Stripe webhook events, updates tenant plan
