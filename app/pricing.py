@@ -36,5 +36,13 @@ def calculate_ai_token_cost_cents(input_tokens=0, cached_input_tokens=0, output_
     return input_cost + cached_cost + output_cost
 
 
+_USAGE_TYPE_TO_LIMIT_KEY = {
+    "api_call": "api_calls",
+    "api_calls": "api_calls",
+    "ai_tokens": "ai_tokens",
+}
+
+
 def plan_limit(plan, usage_type):
-    return PLAN_LIMITS[plan][usage_type]
+    limit_key = _USAGE_TYPE_TO_LIMIT_KEY[usage_type]
+    return PLAN_LIMITS[plan][limit_key]
