@@ -47,5 +47,35 @@ class TestCheckoutSessionCreation(unittest.TestCase):
         self.assertEqual(captured["url"], "https://api.stripe.com/v1/checkout/sessions")
         self.assertEqual(captured["data"]["mode"], "subscription")
         self.assertEqual(captured["data"]["client_reference_id"], "1")
+        self.assertEqual(captured["data"]["metadata[tenant_id]"], "1")
         self.assertEqual(captured["data"]["line_items[0][price]"], "price_fake_pro")
         self.assertEqual(captured["auth"], ("sk_test_fake", ""))
+
+
+from tests.helpers import ApiTestCase
+
+class TestCheckoutRoute(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["STRIPE_SECRET_KEY"] = "sk_test_fake"
+        os.environ["STRIPE_PRICE_ID_PRO"] = "price_fake_pro"
+
+    @patch("app.routes.checkout.create_checkout_session")
+    def test_checkout_route_success(self, mock_create):
+        mock_create.return_value = {
+            "id": "cs_test_route_123",
+            "url": "https://checkout.stripe.com/pay/cs_test_route_123"
+        }
+
+        response = self.client.post("/checkout", json={"tenant_id": 1})
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["session_id"], "cs_test_route_123")
+        self.assertEqual(body["checkout_url"], "https://checkout.stripe.com/pay/cs_test_route_123")
+        mock_create.assert_called_once_with(1)
+
+    def test_checkout_route_missing_tenant_id(self):
+        response = self.client.post("/checkout", json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("tenant_id is required", response.get_json()["error"])
+
