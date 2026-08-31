@@ -1,153 +1,256 @@
 # Usage Metering and Billing Engine
 
-A small backend service that answers the three questions every SaaS billing system has to answer: how much has this tenant used, how much should they pay, and have they hit their plan limit. Built for the FlyRank internship backend track capstone.
+A robust multi-tenant backend service implementing real-time usage metering, quota enforcement, and Stripe subscription billing. Built for the FlyRank capstone metering and billing project.
 
-## What it does
+## Overview
 
-Tenants belong to a plan, either free or pro. Every tenant can call one billable endpoint, `POST /generate`, which either logs an API call or logs AI token usage. The service:
+This application manages usage-based billing and plan-limit tracking for multiple tenants. It allows tenants on a **Free** plan to upgrade to a **Pro** plan using Stripe Checkout subscriptions. Plan upgrades, updates, and cancellations are automatically kept in sync using signature-verified, idempotent Stripe webhook event handlers.
 
-- records usage exactly once per idempotency key, so a retried request never double counts
-- checks the request against the tenant's plan limit before allowing it, and returns 402 or 429 with a clear reason when it is blocked
-- turns AI token usage into a cost in cents using pricing rules where cached input tokens are cheaper and reasoning tokens are billed at the output rate
-- lets a tenant upgrade to pro through a Stripe test mode checkout, and keeps the tenant's plan in sync through signature verified, deduplicated webhooks
+---
 
-## Architecture
+## Key Features
+
+* **Multi-Tenant Isolation**: Every usage record, subscription status check, and rollup aggregates usage by `tenant_id`.
+* **Flexible Usage Metering**: Supports tracking both general API calls and detailed AI token usage.
+* **Intelligent AI Token Pricing**: Cost calculation applies discounts for cached input tokens, bills reasoning tokens at output rates, and avoids simple token aggregation prior to pricing.
+* **Quota Enforcement**: Free tenants are blocked with HTTP `402 Payment Required` upon boundary limit breaches, while Pro tenants receive HTTP `429 Too Many Requests`.
+* **Idempotent Usage Recording**: Usage events are tracked exactly once per `idempotency_key` to avoid double-billing.
+* **Stripe Checkout Subscriptions**: Initiates checkout sessions with Stripe under `mode=subscription` carrying tenant references.
+* **Secure Stripe Webhooks**: Verifies signatures with HMAC-SHA256 and prevents replay/duplicate event processing.
+* **Auto Plan Synchronization**: Automatically handles plan upgrades, status changes, and cancellations.
+
+---
+
+## Architecture & Flow
 
 ```
 Client
-  |
-  |  POST /generate  (tenant_id, idempotency_key, usage_type, quantity or tokens)
-  v
+  │
+  │  POST /generate  (tenant_id, idempotency_key, usage_type, quantity / tokens)
+  ▼
 generate route
-  |
-  v
+  │
+  ▼
 meter_service.record_usage
-  |-- idempotency_responses has this key already? --> return the stored response, nothing else happens
-  |-- otherwise: look up tenant, sum this period's usage, add the new request
-  |-- total within the plan limit?   yes -> insert into usage_events, return 200
-  |                                  no, plan is free  -> return 402, "upgrade to pro to continue"
-  |                                  no, plan is pro   -> return 429, "resets next month"
-  |-- store the response in idempotency_responses under this tenant and key
+  ├── idempotency_responses has this key already? ──> Return stored response, no usage added
+  ├── Otherwise: look up tenant, sum current period usage, add request quantity
+  ├── Total within the plan limit?
+  │     ├── Yes ──> Insert usage event, return 200 OK
+  │     ├── No, Free plan ──> Return 402, "upgrade to pro to continue"
+  │     └── No, Pro plan  ──> Return 429, "usage quota exceeded, resets next month"
+  └── Store response details in idempotency_responses
 
 Client
-  |
-  |  GET /usage?tenant_id=1
-  v
+  │
+  │  GET /usage?tenant_id=1
+  ▼
 usage_service.get_usage_summary
-  |-- sums usage_events for the current month
-  |-- runs the ai token totals through pricing.calculate_ai_token_cost_cents
-  |-- returns used, limit and cost for both api_calls and ai_tokens
+  ├── Sums usage_events for the current billing period
+  ├── Computes live AI token costs via pricing formulas
+  └── Returns usage limits and cost summary
 
 Client
-  |
-  |  POST /checkout  (tenant_id)
-  v
-stripe_client.create_checkout_session --> Stripe test mode --> checkout url
+  │
+  │  POST /checkout  (tenant_id)
+  ▼
+stripe_client.create_checkout_session ──> Stripe API (Test Mode) ──> Return Checkout URL & Session ID
 
 Stripe
-  |
-  |  POST /webhooks/stripe  (signed event)
-  v
+  │
+  │  POST /webhooks/stripe  (Signed payload)
+  ▼
 webhooks route
-  |-- verify_webhook_signature, HMAC-SHA256 over timestamp.payload, bad signature -> 400
-  |-- webhook_service.apply_event
-        |-- event id already in processed_stripe_events? --> ignore, return 200
-        |-- checkout.session.completed        --> tenant plan set to pro, subscription row created
-        |-- customer.subscription.updated     --> tenant plan follows the new status
-        |-- customer.subscription.deleted     --> tenant plan set back to free
-        |-- mark the event id as processed
+  ├── verify_webhook_signature (HMAC-SHA256), bad signature ──> Return 400 Bad Request
+  └── webhook_service.apply_event
+        ├── event_id already in processed_stripe_events? ──> Ignore event, return 200 (de-duplication)
+        ├── checkout.session.completed ──> Upgrade tenant to 'pro', write subscription DB record
+        ├── customer.subscription.updated ──> Sync tenant plan to current subscription status (active/trialing vs unpaid)
+        ├── customer.subscription.deleted ──> Downgrade tenant to 'free', mark status canceled
+        └── Mark event ID as processed in DB
 ```
 
-A background job, `app/jobs/rollup_job.py`, walks every tenant and writes a cached usage rollup into `usage_rollups`. It is meant to run on a schedule rather than inside a request, retries up to three times per tenant, and logs an error if a tenant's rollup keeps failing. `GET /usage` never reads from this cache, it always computes the live number, the cache exists for a dashboard or export job that does not need to recompute the aggregate on every read.
+---
 
-## Data model
+## Metering & Pricing
 
-Six tables, all in `migrations/001_init.sql`: `tenants`, `usage_events`, `idempotency_responses`, `subscriptions`, `processed_stripe_events`, `usage_rollups`. Every usage row, every subscription row and every rollup row carries a `tenant_id`, and every query in the service layer filters by it, so one tenant never sees another tenant's numbers.
+### Plan Quotas
+Plans and limits are configured as follow:
 
-## Plans
+| Plan | API Calls / Month | AI Tokens / Month |
+| :--- | :--- | :--- |
+| **Free** | 1,000 | 100,000 |
+| **Pro** | 100,000 | 5,000,000 |
 
-| Plan | API calls per month | AI tokens per month |
-|------|---------------------|----------------------|
-| Free | 1,000 | 100,000 |
-| Pro  | 100,000 | 5,000,000 |
+### AI Token Pricing Model
+Token pricing is calculated in cents per 1,000,000 tokens using integer division to avoid floating-point inaccuracies:
 
-These live in `app/pricing.py` as `PLAN_LIMITS`. At exactly the limit a request is still allowed, the request that would push the tenant over the limit is the one that gets rejected.
+| Category | Price per Million Tokens |
+| :--- | :--- |
+| **Input Tokens** | 300 cents ($3.00) |
+| **Cached Input Tokens** | 75 cents ($0.75) |
+| **Output Tokens** | 1500 cents ($15.00) |
+| **Reasoning Tokens** | 1500 cents ($15.00) (Billed at output rate) |
 
-## Status codes
+---
 
-A blocked request on the free plan returns 402, because a free tenant genuinely cannot do more without upgrading. A blocked request on the pro plan returns 429, because a pro tenant can simply wait for the next billing period. Both responses include a `reason` field explaining why.
+## Quota & Idempotency
 
-## AI token pricing
+* **Limit Checks**: Quota checks run *before* usage events are saved to the database. The system allows requests up to the plan limit; the first request that crosses the boundary is rejected.
+* **Idempotency Responses**: The database table `idempotency_responses` caches complete response bodies and status codes. Duplicate requests with the same key bypass both limit checking and usage counting, returning the cached response with the `X-Idempotent-Replay: true` header.
 
-Prices are pinned in `app/pricing.py` as cents per one million tokens, and all math is done with integer division, cents are never represented as floats anywhere in this codebase.
+---
 
-| Token category | Price per million tokens |
-|-----------------|---------------------------|
-| input | 300 cents |
-| cached input | 75 cents |
-| output | 1500 cents |
-| reasoning | billed at the output rate, 1500 cents |
+## Stripe Subscription Checkout
 
-Reasoning tokens are folded into the output bucket before pricing rather than kept as their own category, and the three priced categories, input, cached input and output, are never simply added together before pricing, each is priced on its own and the results are summed. `EVIDENCE.md` has a worked example: one million tokens in every category comes out to exactly 3375 cents, and `tests/test_cost.py` checks this same number.
+The endpoint `POST /checkout` is called with a `tenant_id` payload. The service calls Stripe's `/v1/checkout/sessions` endpoint to construct a session. 
 
-## Running it
+To ensure metadata is carried forward correctly, the Stripe session includes:
+* `mode = subscription`
+* `client_reference_id = str(tenant_id)`
+* `metadata[tenant_id] = str(tenant_id)`
+* Line item configured with `STRIPE_PRICE_ID_PRO`
 
-Requires Python 3.10 or newer. No Docker and no Postgres needed, this project uses SQLite, which the capstone brief lists as an accepted free alternative to Postgres via Docker.
+The application relies **entirely** on Stripe webhooks to upgrade plans. Browser redirects to `/checkout/success` do not alter plan status to prevent tampering or client-side race conditions.
+
+---
+
+## Stripe Webhook Processing
+
+Webhook events sent to `POST /webhooks/stripe` undergo signature validation:
+1. **Signature Verification**: Validates the payload against the `Stripe-Signature` header using the webhook signing secret (`STRIPE_WEBHOOK_SECRET`) with `HMAC-SHA256`.
+2. **De-duplication**: Checks the event ID against the `processed_stripe_events` table before applying the transition.
+3. **Transition Rules**:
+   * **`checkout.session.completed`**: Resolves `tenant_id`, upgrades the tenant plan to `pro`, and records the Stripe subscription mappings in `subscriptions` table.
+   * **`customer.subscription.updated`**: Monitors active/trialing states to update the plan or downgrade to `free` (e.g. if payment fails).
+   * **`customer.subscription.deleted`**: Instantly downgrades the tenant back to `free` and updates the subscription status to `canceled`.
+
+---
+
+## Windows Stripe CLI Integration Debugging & Resolution
+
+During local end-to-end integration testing under Windows, we encountered a scenario where checkout creation succeeded, but the plan was not upgraded after payment completion, and no webhook logs appeared on the Flask console.
+
+### The Issue
+Windows PowerShell execution policy restricted scripts from loading, which blocked the Stripe CLI from starting:
+```text
+stripe : File C:\Users\User\AppData\Roaming\npm\stripe.ps1 cannot be loaded because running scripts is disabled on this system.
+```
+As a result, the Stripe listener command was failing silently.
+
+### The Resolution
+To bypass this policy block, we ran the command batch wrapper directly using **`stripe.cmd`** instead of `stripe`. This successfully bypassed PowerShell's script blocks.
+The active webhook secret was fetched using:
+```bash
+stripe.cmd listen --api-key <STRIPE_SECRET_KEY> --forward-to http://127.0.0.1:5000/webhooks/stripe
+```
+Configuring this active secret in the `.env` file allowed Stripe to successfully forward `checkout.session.completed` events and complete the upgrade cycle locally.
+
+---
+
+## Testing
+
+The automated test suite verifies billing boundaries, cost logic, idempotency, and webhook operations. Run tests using:
+```bash
+pytest -q
+```
+
+### Test Results
+```text
+27 passed in 2.70s
+```
+
+---
+
+## Real Stripe End-to-End Verification
+
+The complete flow was verified locally using Stripe Test Mode and the standard test card `4242 4242 4242 4242`:
 
 ```
-pip install -r requirements.txt
-cp .env.example .env
-python seed.py
+POST /checkout (tenant_id = 1)
+        │
+        ▼
+Stripe Checkout Session Created
+        │
+        ▼
+Test Checkout Completed in Browser
+        │
+        ▼
+Stripe emits checkout.session.completed
+        │
+        ▼
+Stripe CLI forwards webhook to local Flask server
+        │
+        ▼
+Flask verifies signature & upgrades Tenant 1 to Pro
+        │
+        ▼
+GET /usage?tenant_id=1 returns plan: "pro"
+```
+
+---
+
+## Screenshots
+
+### 1. Stripe Checkout Success
+This screenshot shows the successful completion of the Stripe checkout flow in Test Mode for Tenant 1:
+
+![Stripe Checkout Success](success.png)
+
+### 2. Pro Plan Confirmation
+This screenshot shows the `GET /usage` response confirming that Tenant 1 was successfully upgraded to the `pro` plan with increased limits after the webhook event was processed:
+
+![Tenant upgraded to Pro](pro-success.png)
+
+---
+
+## Environment Configuration
+
+Configuration variables should be defined in a private `.env` file at the project root:
+
+```env
+DATABASE_PATH=data/billing.db
+PORT=5000
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_PRICE_ID_PRO=price_...
+STRIPE_SUCCESS_URL=http://localhost:5000/checkout/success
+STRIPE_CANCEL_URL=http://localhost:5000/checkout/cancel
+```
+
+---
+
+## Running Locally
+
+### Terminal 1 — Stripe CLI Listener
+```bash
+stripe.cmd listen --api-key sk_test_... --forward-to http://127.0.0.1:5000/webhooks/stripe
+```
+
+### Terminal 2 — Flask Web Application
+```bash
 python run.py
 ```
 
-The server listens on port 5000. `seed.py` creates two tenants: tenant 1, Acme Corp, on the free plan, and tenant 2, Globex Inc, on the pro plan. Run it again any time to reset the database back to that starting point.
+### Terminal 3 — Interactive Verification
+1. **Create Checkout Session**:
+   ```bash
+   curl -X POST http://127.0.0.1:5000/checkout -H "Content-Type: application/json" -d '{"tenant_id":1}'
+   ```
+2. Open the returned URL in your web browser and submit the test payment.
+3. **Verify the plan change**:
+   ```bash
+   curl http://127.0.0.1:5000/usage?tenant_id=1
+   ```
 
-To run the background rollup job by hand:
+---
 
-```
-python -m app.jobs.rollup_job
-```
+## Final Verification Summary
 
-To run the tests:
-
-```
-python -m unittest discover -s tests -v
-```
-
-All 22 tests pass on a clean checkout, see `EVIDENCE.md` for the full output.
-
-Everything pasted into `EVIDENCE.md` was produced by `generate_evidence.py`, which drives the app through the same test client the tests use and prints real request and response bodies. Run `python generate_evidence.py` yourself to reproduce it.
-
-## Trying the endpoints
-
-```
-curl -X POST http://localhost:5000/generate \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id": 1, "idempotency_key": "some-unique-key", "usage_type": "api_call", "quantity": 1}'
-
-curl "http://localhost:5000/usage?tenant_id=1"
-
-curl -X POST http://localhost:5000/checkout \
-  -H "Content-Type: application/json" \
-  -d '{"tenant_id": 1}'
-```
-
-To test webhooks locally with a real Stripe test account, install the Stripe CLI, then:
-
-```
-stripe listen --forward-to localhost:5000/webhooks/stripe
-stripe trigger checkout.session.completed
-```
-
-The CLI prints the `whsec_` value to put in `.env` as `STRIPE_WEBHOOK_SECRET` the first time you run `stripe listen`.
-
-## Limitations, stated honestly
-
-This was built and tested in a sandboxed environment with no outbound network access, so the Stripe API itself was never actually reached from here. Everything that can be verified without a network call has been verified for real: webhook signature verification is pure HMAC-SHA256 and was tested against real signed payloads, event deduplication was tested by sending the same event id twice, and the plan upgrade and downgrade logic was tested end to end through the webhook handler. What was not run for real is the actual `POST` to `api.stripe.com/v1/checkout/sessions`, since that needs network access and a real Stripe test secret key. The request that gets sent is exercised through a stubbed HTTP call in `tests/test_checkout.py`, which confirms the correct mode, price id and tenant reference are sent. Anyone running this project with a real `STRIPE_SECRET_KEY` and `STRIPE_PRICE_ID_PRO` gets the identical code path, `create_checkout_session` does not know or care whether the http call is real or stubbed.
-
-Also out of scope for this core build, matching what the capstone brief calls stretch goals: overage billing, invoices, proration, and a nightly reconciliation job against Stripe.
-
-## Required files
-
-`README.md` (this file), `capstone.yaml`, `EVIDENCE.md`, `BUILDLOG.md`, `.env.example`, `DESIGN.md`.
+* **Automated Tests**: 27 Passed, 0 Failed
+* **Stripe Checkout Route**: Verified (Returns checkout URL and Session ID)
+* **Subscription Mode**: Verified (`mode=subscription` validated on Stripe sessions)
+* **Tenant Metadata Mappings**: Verified (`client_reference_id` and `metadata.tenant_id` set correctly)
+* **Webhook Signature Verification**: Verified (Verifies headers against signing secret)
+* **Webhook Forwarding & Processing**: Verified (Stripe CLI routes events successfully)
+* **Free → Pro Plan Upgrades**: Verified (Tenant updated to `pro` after subscription completion)
+* **Webhook Event De-duplication**: Verified (Ensures Stripe events are processed only once)
